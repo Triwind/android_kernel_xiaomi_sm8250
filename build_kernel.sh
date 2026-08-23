@@ -127,6 +127,12 @@ echo "[+] AnyKernel3 cloned successfully."
 echo "==========================================="
 
 # ---------------- 编译参数 ----------------
+echo "[*] Patching out unsupported -fno-var-tracking-assignments ..."
+find . -name "Makefile" -o -name "*.mk" | xargs sed -i 's/-fno-var-tracking-assignments//g' 2>/dev/null || true
+
+echo "[*] Checking for conflicting -fno-pic with -fno-var-tracking-assignments..."
+sed -i '/-fno-var-tracking-assignments/d' $(find . -name "Makefile" -o -name "*.mk" | tr '\n' ' ') 2>/dev/null || true
+
 MAKE_OPTS=(
     -j"$(nproc)"
     O="${OUT_DIR}"
@@ -229,6 +235,8 @@ if [ -f "${OUT_DIR}/arch/arm64/boot/Image" ]; then
     echo "[*] Zipping $ZIP_FILENAME ..."
     pushd anykernel > /dev/null
     zip -r9 "$ZIP_FILENAME" ./* -x .git .gitignore out/ ./*.zip > /dev/null
+    # 复制到当前工作目录（GitHub Actions 的根目录）
+    cp "$ZIP_FILENAME" "${GITHUB_WORKSPACE:-.}/"
     mv "$ZIP_FILENAME" ../
     popd > /dev/null
 
