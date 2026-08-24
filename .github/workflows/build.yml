@@ -266,29 +266,36 @@ jobs:
       # 集成阶段（ReSukiSU & SUSFS / 手动挂钩分支）
       # =====================================================================
 
-      - name: "集成阶段 1: 打入 SUSFS 4.19 基线补丁 (仅限 inline_susfs)"
+      - name: "集成阶段 1: 打入 SUSFS 4.19 基线补丁 (自动检测，已内置则跳过)"
         if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'inline_susfs'
         run: |
           cd "$KERNEL_DIR"
+
+          # ⚠️ 关键防护：检测源码树是否已内置 SUSFS（如本仓库自带 fs/susfs.c）。
+          # 重复打基线补丁会造成混合污染（部分 hunk 带 fuzz 二次插入代码）。
+          if [ -f "fs/susfs.c" ] && grep -q "susfs" fs/Makefile 2>/dev/null; then
+            echo "✅ 检测到源码已内置 SUSFS (fs/susfs.c + fs/Makefile 编译条目)"
+            echo "   跳过基线补丁注入，直接使用源码自带的 SUSFS 实现。"
+            exit 0
+          fi
+
           if [ -f "$PATCH_DIR/Patches/Patch/susfs_patch_to_4.19.patch" ]; then
             patch -p1 < "$PATCH_DIR/Patches/Patch/susfs_patch_to_4.19.patch" || true
 
             REJ_FILES=$(find . -name "*.rej")
             if [ -n "$REJ_FILES" ]; then
               echo "=================================================="
-              echo "❌ 警告: 补丁部分冲突！正在分析文件修改状态..."
+              echo "❌ 补丁存在未成功应用的冲突！为防止静默污染内核树，本次构建终止。"
               echo "=================================================="
               for rej_file in $REJ_FILES; do
                 target_file="${rej_file%.rej}"
                 echo "📄 目标文件: $target_file"
-                if git status --porcelain "$target_file" | grep -q "M"; then
-                  git diff "$target_file"
-                else
-                  echo "（该文件未成功应用任何改动，全部冲突）"
-                fi
+                git status --porcelain "$target_file" | grep -q "M" && git diff "$target_file" || echo "（该文件未成功应用任何改动）"
                 echo "⚠️ [未成功应用的冲突内容 (.rej)] :"
                 cat "$rej_file"
               done
+              echo "💡 提示：源码若已含部分 SUSFS/VFS 改动，应保持跳过策略而非强行叠加补丁。"
+              exit 1
             else
               echo "✅ 提示: SUSFS 基线补丁打入成功，无冲突。"
             fi
@@ -322,11 +329,17 @@ jobs:
             find . -name "*.orig" -delete
           fi
 
-      - name: "集成阶段 2: 注入 ReSukiSU 基准框架"
+      - name: "集成阶段 2: 注入 ReSukiSU 基准框架 (已存在则跳过)"
         if: env.RUN_KSU_SUSFS == 'true'
         run: |
           cd "$KERNEL_DIR"
-          curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main || curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash
+          if [ -d "drivers/kernelsu" ]; then
+            echo "✅ 检测到 drivers/kernelsu 已存在，跳过 ReSukiSU 注入。"
+          else
+            echo "🚀 正在拉取 ReSukiSU setup.sh 注入内核..."
+            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main || curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash
+            echo "✅ KernelSU setup finished."
+          fi
 
       - name: "集成阶段 3A: 应用 JackA1ltman Non-GKI 核心基础设施 (inline_susfs 分支)"
         if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'inline_susfs'
