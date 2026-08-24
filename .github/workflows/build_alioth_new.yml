@@ -1,0 +1,815 @@
+# =============================================================================
+# Custom Kernel 4.19 for Xiaomi alioth (Redmi K40 / POCO F3 / Mi 11X, SM8250)
+# -----------------------------------------------------------------------------
+# 由两份工作流整合而来，并已对齐外部编译脚本 build_kernel.sh (APTKernel)：
+#   - build.yml       （whyred 全功能内联版：多工具链 / SUSFS / Droidspaces）
+#   - build-1.yml     （多机型轻量版：机型选择 + KSU 开关 + zyc-clang）
+#   - build_kernel.sh （APTKernel 外部脚本：Baseband-guard / MIUI-AOSP 配置集 / kona AK3 打包）
+# 本版面向 alioth：A/B 槽设备、Image + dtb、非 GKI 4.19。
+# 放置路径：<你的内核源码仓库>/.github/workflows/build.yml
+# 仅支持手动触发 (workflow_dispatch)；默认工具链 neutron。
+# =============================================================================
+name: "Custom Kernel 4.19 for alioth"
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '要编译的内核分支 (留空 = 当前触发分支)'
+        required: false
+        default: ''
+      toolchain:
+        description: '选择 Clang 工具链 / 编译器'
+        required: false
+        default: 'neutron'
+        type: choice
+        options:
+          - aosp
+          - neutron
+          - zyc
+      target_os:
+        description: '目标系统 (miui=MIUI配置集+强制LTO关闭; aosp=AOSP配置集)'
+        required: false
+        default: 'aosp'
+        type: choice
+        options:
+          - aosp
+          - miui
+
+      lto_mode:
+        description: 'LTO 优化模式 (thin/full/none)'
+        required: false
+        default: 'thin'
+        type: choice
+        options:
+          - thin
+          - full
+          - none
+      hook_type:
+        description: '选择 ReSukiSU 挂钩类型 (二选一)'
+        required: true
+        default: 'inline_susfs'
+        type: choice
+        options:
+          - 'inline_susfs'
+          - 'manual_hook'
+      enable_ksu_susfs:
+        description: '开启 ReSukiSU 功能模块'
+        required: true
+        type: boolean
+        default: true
+      enable_baseband_guard:
+        description: '集成 Baseband-guard 基带分区防护 (与 build_kernel.sh 对齐)'
+        required: true
+        type: boolean
+        default: true
+      enable_droidspaces:
+        description: '注入 Droidspaces & 容器化基础设施适配'
+        required: true
+        type: boolean
+        default: true
+      miui_dts_patches:
+        description: 'target_os=miui 时应用原脚本 DTS 面板补丁 (面板名未必匹配 alioth)'
+        required: false
+        type: boolean
+        default: false
+      defconfig:
+        description: 'Defconfig (位于 arch/arm64/configs/ 下；支持空格分隔多个片段)'
+        required: false
+        default: 'alioth_defconfig'
+      artifact_scope:
+        description: '上传的产物范围'
+        required: false
+        default: 'compact'
+        type: choice
+        options:
+          - compact
+          - complete
+env:
+  DEVICE: alioth
+  KERNEL_DIR: ${{ github.workspace }}/kernel
+  TC_AOSP_DIR: ${{ github.workspace }}/toolchain/aosp-clang
+  TC_NEUTRON_DIR: ${{ github.workspace }}/toolchain/neutron-clang
+  TC_ZYC_DIR: ${{ github.workspace }}/toolchain/zyc-clang
+  OUT_DIR: ${{ github.workspace }}/kernel/out
+  PATCH_DIR: ${{ github.workspace }}/patch_repo
+  ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
+  AOSP_CLANG_TAG: r547379
+  AOSP_CLANG_URL: https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86
+  # 动态分支计算
+  BUILD_BRANCH: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.branch || github.ref_name }}
+  # 外部开关与挂钩模式转环境变量
+  RUN_KSU_SUSFS: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_ksu_susfs || 'true' }}
+  HOOK_TYPE: ${{ github.event.inputs.hook_type || 'inline_susfs' }}
+  RUN_DROIDSPACES: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_droidspaces || 'true' }}
+  RUN_BBG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.enable_baseband_guard || 'true' }}
+  TARGET_OS: ${{ github.event.inputs.target_os || 'aosp' }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: kernel-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build alioth | ReSukiSU/SUSFS + Baseband-guard + Droidspaces
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      # 1. 检出源码
+      - name: 检出内核源码
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BUILD_BRANCH }}
+          fetch-depth: 1
+          path: kernel
+
+      # 2. 检查可用磁盘空间
+      - name: 检查剩余磁盘空间
+        run: df -h /
+
+      # 3. 释放 Runner 磁盘空间（内核 + 工具链 + out 目录很占空间）
+      - name: 释放 Runner 磁盘空间
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          sudo docker image prune -af > /dev/null 2>&1 || true
+          df -h /
+
+      # 4. 配置额外的虚拟内存 (Swap)
+      - name: 设置额外的虚拟内存
+        run: |
+          LTO_MODE="${{ github.event.inputs.lto_mode || 'thin' }}"
+          if [ "$LTO_MODE" = "full" ]; then
+            SWAP_SIZE="8G"
+          else
+            SWAP_SIZE="4G"
+          fi
+          echo "正在添加 ${SWAP_SIZE} 的虚拟内存 (LTO 模式: ${LTO_MODE})..."
+          sudo fallocate -l "$SWAP_SIZE" /swapfile_ci
+          sudo chmod 600 /swapfile_ci
+          sudo mkswap /swapfile_ci
+          sudo swapon /swapfile_ci
+          free -h
+
+      # 5. 安装编译所需的依赖环境
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bc bison flex libssl-dev libelf-dev libncurses-dev \
+            build-essential zip curl wget git python3 \
+            python-is-python3 ccache llvm lld coccinelle \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      # =========================================================
+      # 6. 工具链配置与缓存控制（三选一，来自 build-1/build.yml 合并）
+      # =========================================================
+
+      # 6.1 AOSP Clang（默认；固定 tag 缓存，最稳）
+      - name: 缓存 AOSP Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'aosp' }}
+        id: cache-aosp
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TC_AOSP_DIR }}
+          key: aosp-clang-${{ env.AOSP_CLANG_TAG }}
+
+      - name: 下载 AOSP Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'aosp' && steps.cache-aosp.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p "$TC_AOSP_DIR"
+          curl -L --fail \
+            "${AOSP_CLANG_URL}/+archive/refs/heads/main/clang-${AOSP_CLANG_TAG}.tar.gz" \
+            -o /tmp/clang.tar.gz
+          tar -xzf /tmp/clang.tar.gz -C "$TC_AOSP_DIR"
+          rm -f /tmp/clang.tar.gz
+
+      # 6.2 获取当前周数（用于 Neutron/ZyC 缓存校验）
+      - name: 获取当前周数 (用于 Neutron/ZyC 缓存校验)
+        if: ${{ (github.event.inputs.toolchain || 'neutron') != 'aosp' }}
+        id: get-date
+        run: echo "date=$(date +'%Y-%U')" >> "$GITHUB_OUTPUT"
+
+      # 6.3 Neutron Clang
+      - name: 缓存 Neutron Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'neutron' }}
+        id: cache-neutron
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TC_NEUTRON_DIR }}
+          key: neutron-clang-${{ steps.get-date.outputs.date }}
+          restore-keys: |
+            neutron-clang-
+
+      - name: 下载 Neutron Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'neutron' && steps.cache-neutron.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p "$TC_NEUTRON_DIR"
+          cd "$TC_NEUTRON_DIR"
+          curl -LO "https://raw.githubusercontent.com/Neutron-Toolchains/antman/main/antman"
+          chmod +x antman
+          ./antman -S
+
+      # 6.4 ZyCromerZ Clang（跟随上游最新 release）
+      - name: 缓存 ZyC Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'zyc' }}
+        id: cache-zyc
+        uses: actions/cache@v6
+        with:
+          path: ${{ env.TC_ZYC_DIR }}
+          key: zyc-clang-${{ steps.get-date.outputs.date }}
+          restore-keys: |
+            zyc-clang-
+
+      - name: 下载 ZyC Clang 工具链
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'zyc' && steps.cache-zyc.outputs.cache-hit != 'true' }}
+        run: |
+          mkdir -p "$TC_ZYC_DIR"
+          echo "正在获取 ZyC Clang 最新下载链接..."
+          ZYC_URL=$(curl -sSL "https://raw.githubusercontent.com/ZyCromerZ/Clang/main/Clang-main-link.txt" | head -n 1 | xargs)
+          if [ -z "$ZYC_URL" ]; then
+            echo "错误：无法解析 ZyC Clang 下载链接！" && exit 1
+          fi
+          echo "正在下载 ZyC Clang: $ZYC_URL"
+          curl -L --fail "$ZYC_URL" -o /tmp/zyc_clang.tar.gz
+          tar -xzf /tmp/zyc_clang.tar.gz -C "$TC_ZYC_DIR"
+          rm -f /tmp/zyc_clang.tar.gz
+
+      # 6.5 克隆外部补丁仓库（SUSFS / 手动挂钩 / Droidspaces 补丁源）
+      - name: 克隆补丁仓库
+        if: env.RUN_KSU_SUSFS == 'true' || env.RUN_DROIDSPACES == 'true'
+        run: |
+          git clone --depth=1 https://github.com/xmanweb/NonGKI_Kernel_Build_2nd.git -b mainline "${{ env.PATCH_DIR }}"
+
+      # 7. 配置 ccache 编译缓存
+      - name: 缓存 ccache 数据
+        uses: actions/cache@v6
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-
+            ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-
+
+      - name: 初始化 ccache 设置
+        run: |
+          export CCACHE_DIR=~/.ccache
+          ccache -M 5G
+          ccache -z
+
+      # =====================================================================
+      # 集成阶段（ReSukiSU & SUSFS / 手动挂钩分支）
+      # =====================================================================
+
+      - name: "集成阶段 1: 打入 SUSFS 4.19 基线补丁 (自动检测，已内置则跳过)"
+        if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'inline_susfs'
+        run: |
+          cd "$KERNEL_DIR"
+
+          # ⚠️ 关键防护：检测源码树是否已内置 SUSFS（如本仓库自带 fs/susfs.c）。
+          # 重复打基线补丁会造成混合污染（部分 hunk 带 fuzz 二次插入代码）。
+          if [ -f "fs/susfs.c" ] && grep -q "susfs" fs/Makefile 2>/dev/null; then
+            echo "✅ 检测到源码已内置 SUSFS (fs/susfs.c + fs/Makefile 编译条目)"
+            echo "   跳过基线补丁注入，直接使用源码自带的 SUSFS 实现。"
+            exit 0
+          fi
+
+          if [ -f "$PATCH_DIR/Patches/Patch/susfs_patch_to_4.19.patch" ]; then
+            patch -p1 < "$PATCH_DIR/Patches/Patch/susfs_patch_to_4.19.patch" || true
+
+            REJ_FILES=$(find . -name "*.rej")
+            if [ -n "$REJ_FILES" ]; then
+              echo "=================================================="
+              echo "❌ 补丁存在未成功应用的冲突！为防止静默污染内核树，本次构建终止。"
+              echo "=================================================="
+              for rej_file in $REJ_FILES; do
+                target_file="${rej_file%.rej}"
+                echo "📄 目标文件: $target_file"
+                git status --porcelain "$target_file" | grep -q "M" && git diff "$target_file" || echo "（该文件未成功应用任何改动）"
+                echo "⚠️ [未成功应用的冲突内容 (.rej)] :"
+                cat "$rej_file"
+              done
+              echo "💡 提示：源码若已含部分 SUSFS/VFS 改动，应保持跳过策略而非强行叠加补丁。"
+              exit 1
+            else
+              echo "✅ 提示: SUSFS 基线补丁打入成功，无冲突。"
+            fi
+          else
+            echo "❌ 错误: 未找到对应的补丁文件 susfs_patch_to_4.19.patch" && exit 1
+          fi
+
+      - name: "集成阶段 1.5: 拦截并手动拯救失败的代码块 (仅限 inline_susfs)"
+        if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'inline_susfs'
+        run: |
+          cd "$KERNEL_DIR"
+          if [ -f ".github/workflows/rescue_hunks.sh" ]; then
+            REJ_FILES=$(find . -name "*.rej")
+            echo "🚀 开始运行手动修复脚本..."
+            chmod +x .github/workflows/rescue_hunks.sh
+            ./.github/workflows/rescue_hunks.sh
+
+            echo "🔍 [修复结果审计] 核对修复后的最终 Diff..."
+            if [ -n "$REJ_FILES" ]; then
+              for rej_file in $REJ_FILES; do
+                target_file="${rej_file%.rej}"
+                echo "🛠️ 曾冲突文件: $target_file"
+                [ -f "$target_file" ] && git diff "$target_file" || echo "⚠️ 警告: 目标文件不存在。"
+              done
+            fi
+            find . -name "*.rej" -delete
+            find . -name "*.orig" -delete
+          else
+            echo "⚠️ 提示: 未检测到救援脚本，直接清理残余痕迹。"
+            find . -name "*.rej" -delete
+            find . -name "*.orig" -delete
+          fi
+
+      - name: "集成阶段 2: 注入 ReSukiSU 基准框架 (已存在则跳过)"
+        if: env.RUN_KSU_SUSFS == 'true'
+        run: |
+          cd "$KERNEL_DIR"
+          if [ -d "drivers/kernelsu" ]; then
+            echo "✅ 检测到 drivers/kernelsu 已存在，跳过 ReSukiSU 注入。"
+          else
+            echo "🚀 正在拉取 ReSukiSU setup.sh 注入内核..."
+            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main || curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash
+            echo "✅ KernelSU setup finished."
+          fi
+
+      - name: "集成阶段 3A: 应用 JackA1ltman Non-GKI 核心基础设施 (inline_susfs 分支)"
+        if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'inline_susfs'
+        run: |
+          cd "$KERNEL_DIR"
+          if [ -f "$PATCH_DIR/Patches/susfs_inline_hook_patches.sh" ]; then
+            bash "$PATCH_DIR/Patches/susfs_inline_hook_patches.sh" || echo "注意: VFS 树适配完成。"
+          fi
+          echo "Fixing static symbol visibility for SELinux Hooks..."
+          if [ -f "security/selinux/selinuxfs.c" ]; then
+            sed -i 's/static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/g' security/selinux/selinuxfs.c
+            sed -i 's/static ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t)/ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t)/g' security/selinux/selinuxfs.c
+          fi
+          echo "=================================================="
+          echo "🔍 [inline_susfs 最终修改审计 - 代码 Diff]"
+          echo "=================================================="
+          git diff \
+            fs/exec.c \
+            fs/open.c \
+            fs/read_write.c \
+            fs/stat.c \
+            drivers/input/input.c \
+            security/selinux/hooks.c \
+            kernel/reboot.c \
+            kernel/sys.c \
+            include/linux/seccomp.h \
+            security/selinux/selinuxfs.c 2>/dev/null || true
+          echo "=================================================="
+
+      - name: "集成阶段 3B: 注入 ReSukiSU 系统调用手动挂钩 (manual_hook 分支)"
+        if: env.RUN_KSU_SUSFS == 'true' && env.HOOK_TYPE == 'manual_hook'
+        run: |
+          cd "$KERNEL_DIR"
+          echo "🚀 正在拉取并执行 4.19 手动挂钩脚本分支基础设施..."
+          if [ -f "$PATCH_DIR/Patches/syscall_hook_patches.sh" ]; then
+            chmod +x "$PATCH_DIR/Patches/syscall_hook_patches.sh"
+            "$PATCH_DIR/Patches/syscall_hook_patches.sh"
+            echo "✅ Syscall 手动挂钩方案注入完毕。"
+          else
+            echo "❌ 核心错误：无法完成内核 Syscall Hook 适配！" && exit 1
+          fi
+          echo "Fixing static symbol visibility for SELinux Hooks..."
+          if [ -f "security/selinux/selinuxfs.c" ]; then
+            sed -i 's/static const struct file_operations sel_handle_status_ops/const struct file_operations sel_handle_status_ops/g' security/selinux/selinuxfs.c
+            sed -i 's/static ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t)/ssize_t (\*const write_op\[\])(struct file \*, char \*, size_t)/g' security/selinux/selinuxfs.c
+          fi
+          echo "=================================================="
+          echo "🔍 [manual_hook 最终修改审计 - 代码 Diff]"
+          echo "=================================================="
+          git diff \
+            fs/exec.c \
+            fs/open.c \
+            fs/read_write.c \
+            fs/stat.c \
+            drivers/input/input.c \
+            kernel/reboot.c \
+            kernel/sys.c \
+            include/linux/seccomp.h \
+            security/selinux/selinuxfs.c 2>/dev/null || true
+          echo "=================================================="
+
+      - name: "集成阶段 4: 适配 Droidspaces & Docker 容器基础设施"
+        if: env.RUN_DROIDSPACES == 'true'
+        run: |
+          cd "$KERNEL_DIR"
+          DROID_PATCH_DIR="$PATCH_DIR/Patches/Droidspaces"
+
+          if [ -f "net/netfilter/xt_qtaguid.c" ] && [ -f "$DROID_PATCH_DIR/fix_kernel_panic_in_xt_qtaguid.cocci" ]; then
+            spatch --sp-file "$DROID_PATCH_DIR/fix_kernel_panic_in_xt_qtaguid.cocci" --in-place net/netfilter/xt_qtaguid.c
+          fi
+          if [ -f "kernel/cgroup/cgroup.c" ] && [ -f "$DROID_PATCH_DIR/fix_restore_cgroup_file_prefix_handling.cocci" ]; then
+            spatch --sp-file "$DROID_PATCH_DIR/fix_restore_cgroup_file_prefix_handling.cocci" --in-place kernel/cgroup/cgroup.c
+          fi
+
+      - name: "集成阶段 5: 集成 Baseband-guard 基带防护 (与 build_kernel.sh 对齐)"
+        if: env.RUN_BBG == 'true'
+        run: |
+          cd "$KERNEL_DIR"
+          echo "🚀 正在拉取并执行 Baseband-guard 安装脚本..."
+          wget -O- https://github.com/vc-teahouse/Baseband-guard/raw/main/setup.sh | bash
+          echo "[*] Patching security/Kconfig for baseband_guard..."
+          sed -i '/^config LSM$/,/^help$/{ /^[[:space:]]*default/ { /baseband_guard/! s/selinux/selinux,baseband_guard/ } }' security/Kconfig
+          echo "✅ Baseband-guard 集成完毕。"
+
+      # =====================================================================
+      # 编译阶段
+      # =====================================================================
+
+      # 8. 配置选定工具链到环境变量 PATH
+      - name: 配置工具链环境变量 PATH
+        run: |
+          TOOLCHAIN_CHOICE="${{ github.event.inputs.toolchain || 'neutron' }}"
+          if [ "$TOOLCHAIN_CHOICE" = "neutron" ]; then
+            echo "激活编译器: Neutron Clang"
+            echo "$TC_NEUTRON_DIR/bin" >> "$GITHUB_PATH"
+          elif [ "$TOOLCHAIN_CHOICE" = "zyc" ]; then
+            echo "激活编译器: ZyCromerZ Clang"
+            echo "$TC_ZYC_DIR/bin" >> "$GITHUB_PATH"
+          else
+            echo "激活编译器: AOSP Clang"
+            echo "$TC_AOSP_DIR/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: 显示工具链详细信息
+        run: |
+          which clang
+          clang --version
+
+      # 9. 准备产物名称
+      - name: 准备产物名称
+        id: meta
+        if: always()
+        run: |
+          BRANCH_NAME="${{ env.BUILD_BRANCH }}"
+          BRANCH_SAFE="${BRANCH_NAME//\//-}"
+
+          DATE_STR=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M')
+          TOOLCHAIN_LABEL="${{ github.event.inputs.toolchain || 'neutron' }}"
+
+          TRACK=""
+          if [ "${{ env.RUN_KSU_SUSFS }}" = "true" ]; then
+            if [ "${{ env.HOOK_TYPE }}" = "inline_susfs" ]; then
+              TRACK="${TRACK}-resuki-susfs"
+            else
+              TRACK="${TRACK}-resuki-manual"
+            fi
+          fi
+          [ "${{ env.RUN_DROIDSPACES }}" = "true" ] && TRACK="${TRACK}-droid"
+          [ -z "$TRACK" ] && TRACK="-PURE"
+
+          echo "base_name=kernel-4.19-alioth-${TOOLCHAIN_LABEL}-${BRANCH_SAFE}${TRACK}-${TARGET_OS}-${{ github.run_number }}-${DATE_STR}" >> "$GITHUB_OUTPUT"
+
+      # 10. 执行内核编译
+      - name: 编译内核主体
+        id: build
+        run: |
+          START_TIME=$(date +%s)
+          cd "$KERNEL_DIR"
+
+          mkdir -p "$OUT_DIR"
+
+          DEFCONFIG="${{ github.event.inputs.defconfig || 'alioth_defconfig' }}"
+          LTO_MODE="${{ github.event.inputs.lto_mode || 'thin' }}"
+
+          # 与 build_kernel.sh 对齐：MIUI 配置集要求 LTO_NONE (-d LTO_CLANG -e LTO_NONE)，
+          # 命令行 LTO=thin 会覆盖 .config，故 miui 目标强制关闭 LTO
+          if [ "${{ env.TARGET_OS }}" = "miui" ] && [ "$LTO_MODE" != "none" ]; then
+            echo "⚠️ target_os=miui 将强制关闭 LTO (MIUI 配置集要求 LTO_NONE)"
+            LTO_MODE="none"
+          fi
+
+          CUSTOM_CFLAGS="-march=armv8-a"
+          # 提示：若上游脚本要求，可自行追加 -mno-outline 等参数；
+          # 如遇 clang "unknown argument" 报错，删除对应参数即可。
+
+          TOOLCHAIN_ARGS=(
+            ARCH=arm64
+            SUBARCH=arm64
+            CC="ccache clang"
+            HOSTCC="ccache clang"
+            HOSTCXX="ccache clang++"
+            LD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            READELF=llvm-readelf
+            OBJSIZE=llvm-size
+            LLVM=1
+            LLVM_IAS=1
+            KBUILD_BUILD_USER=alioth-builder
+            KBUILD_BUILD_HOST=GithubActions
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+            CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+            KCFLAGS="$CUSTOM_CFLAGS"
+          )
+
+          if [ "$LTO_MODE" != "none" ]; then
+            TOOLCHAIN_ARGS+=(LTO="$LTO_MODE")
+          fi
+
+          # ------------------------------------------------------------
+          # MIUI DTS 面板补丁 (移植自 build_kernel.sh，可选，默认关闭)
+          # 原脚本的 sed 列表面向其原支持机型的面板文件；
+          # alioth 源码若无同名文件则自动跳过 (|| true)，可按需自行扩充。
+          # ------------------------------------------------------------
+          DTS_PATCHED="false"
+          DTS_SOURCE="arch/arm64/boot/dts/vendor/qcom"
+          if [ "${{ env.TARGET_OS }}" = "miui" ] && [ "${{ github.event.inputs.miui_dts_patches || 'false' }}" = "true" ] && [ -d "$DTS_SOURCE" ]; then
+            echo "[*] Applying MIUI DTS patches..."
+            cp -a "${DTS_SOURCE}" ".dts.bak.miui"
+            sed -i 's/<154>/<1537>/g' ${DTS_SOURCE}/dsi-panel-j1s* || true
+            sed -i 's/<154>/<1537>/g' ${DTS_SOURCE}/dsi-panel-j2* || true
+            sed -i 's/<155>/<1544>/g' ${DTS_SOURCE}/dsi-panel-j3s-37-02-0a-dsc-video.dtsi || true
+            sed -i 's/<155>/<1545>/g' ${DTS_SOURCE}/dsi-panel-j11-38-08-0a-fhd-cmd.dtsi || true
+            sed -i 's/<155>/<1546>/g' ${DTS_SOURCE}/dsi-panel-k11a-38-08-0a-dsc-cmd.dtsi || true
+            sed -i 's/<155>/<1546>/g' ${DTS_SOURCE}/dsi-panel-l11r-38-08-0a-dsc-cmd.dtsi || true
+            sed -i 's/<70>/<695>/g' ${DTS_SOURCE}/dsi-panel-j11-38-08-0a-fhd-cmd.dtsi || true
+            sed -i 's/<70>/<695>/g' ${DTS_SOURCE}/dsi-panel-j3s-37-02-0a-dsc-video.dtsi || true
+            sed -i 's/<70>/<695>/g' ${DTS_SOURCE}/dsi-panel-k11a-38-08-0a-dsc-cmd.dtsi || true
+            sed -i 's/<70>/<695>/g' ${DTS_SOURCE}/dsi-panel-l11r-38-08-0a-dsc-cmd.dtsi || true
+            sed -i 's/<71>/<710>/g' ${DTS_SOURCE}/dsi-panel-j1s* || true
+            sed -i 's/<71>/<710>/g' ${DTS_SOURCE}/dsi-panel-j2* || true
+            sed -i 's/\/\/ mi,mdss-dsi-pan-enable-smart-fps/mi,mdss-dsi-pan-enable-smart-fps/g' ${DTS_SOURCE}/dsi-panel* || true
+            sed -i 's/\/\/ mi,mdss-dsi-smart-fps-max_framerate/mi,mdss-dsi-smart-fps-max_framerate/g' ${DTS_SOURCE}/dsi-panel* || true
+            sed -i 's/\/\/ qcom,mdss-dsi-pan-enable-smart-fps/qcom,mdss-dsi-pan-enable-smart-fps/g' ${DTS_SOURCE}/dsi-panel* || true
+            sed -i 's/qcom,mdss-dsi-qsync-min-refresh-rate/\/\/qcom,mdss-dsi-qsync-min-refresh-rate/g' ${DTS_SOURCE}/dsi-panel* || true
+            sed -i 's/120 90 60/120 90 60 50 30/g' ${DTS_SOURCE}/dsi-panel-g7a-36-02-0c-dsc-video.dtsi || true
+            sed -i 's/120 90 60/120 90 60 50 30/g' ${DTS_SOURCE}/dsi-panel-g7a-37-02-0a-dsc-video.dtsi || true
+            sed -i 's/120 90 60/120 90 60 50 30/g' ${DTS_SOURCE}/dsi-panel-g7a-37-02-0b-dsc-video.dtsi || true
+            sed -i 's/144 120 90 60/144 120 90 60 50 48 30/g' ${DTS_SOURCE}/dsi-panel-j3s-37-02-0a-dsc-video.dtsi || true
+            DTS_PATCHED="true"
+          fi
+
+          echo "=== 正在生成配置树: $DEFCONFIG | LTO 模式: $LTO_MODE ==="
+
+          # 支持多片段 defconfig 依次合并（如基础 sm8250 片段 + 设备片段）
+          make O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" $DEFCONFIG
+
+          # 根据 Hook 类型动态追写宏定义
+          CONFIG_ARGS=(
+            -e SERIAL_MSM
+            -e SERIAL_MSM_CONSOLE
+          )
+
+          # Baseband-guard (与 build_kernel.sh 一致：无条件注入 BBG)
+          if [ "${{ env.RUN_BBG }}" = "true" ]; then
+            CONFIG_ARGS+=(-e BBG)
+          fi
+
+          if [ "${{ env.RUN_KSU_SUSFS }}" = "true" ]; then
+            # 基础 KSU 常规宏 (THREAD_INFO_IN_TASK 为非 GKI 4.19 必需，与 build_kernel.sh 对齐)
+            CONFIG_ARGS+=(-e KSU -e KSU_MULTI_MANAGER_SUPPORT -e THREAD_INFO_IN_TASK)
+
+            if [ "${{ env.HOOK_TYPE }}" = "inline_susfs" ]; then
+              # 内联 SUSFS 专用宏配置
+              CONFIG_ARGS+=(\
+                -e KSU_SUSFS -e KSU_SUSFS_SUS_PATH -e KSU_SUSFS_SUS_MOUNT \
+                -e KSU_SUSFS_SUS_KSTAT -e KSU_SUSFS_SPOOF_UNAME -e KSU_SUSFS_ENABLE_LOG \
+                -e KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS -e KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG \
+                -e KSU_SUSFS_OPEN_REDIRECT -e KSU_SUSFS_SUS_MAP -d KSU_TRACEPOINT_HOOK \
+              )
+            else
+              # 手动 Syscall 挂钩专用宏配置
+              CONFIG_ARGS+=(\
+                -e KSU_MANUAL_HOOK \
+                -d KSU_MANUAL_HOOK_AUTO_INPUT_HOOK \
+                -d KSU_MANUAL_HOOK_AUTO_SETUID_HOOK \
+                -d KSU_MANUAL_HOOK_AUTO_INITRC_HOOK \
+                -d KSU_TRACEPOINT_HOOK \
+                -d KSU_SUSFS \
+              )
+            fi
+          fi
+
+          if [ "${{ env.RUN_DROIDSPACES }}" = "true" ]; then
+            CONFIG_ARGS+=(\
+              -e PSI \
+              -d ANDROID_PARANOID_NETWORK \
+              -e USER_NS \
+            )
+          fi
+
+          # 目标系统差异化配置 (移植自 build_kernel.sh 的 MIUI/AOSP 配置集)
+          if [ "${{ env.TARGET_OS }}" = "miui" ]; then
+            echo "[*] Injecting MIUI specific configurations..."
+            CONFIG_ARGS+=(\
+              --set-str STATIC_USERMODEHELPER_PATH /system/bin/micd \
+              -e PERF_CRITICAL_RT_TASK \
+              -e SF_BINDER \
+              -e OVERLAY_FS \
+              -e MIGT \
+              -e MIGT_ENERGY_MODEL \
+              -e MIHW \
+              -e PACKAGE_RUNTIME_INFO \
+              -e BINDER_OPT \
+              -e KPERFEVENTS \
+              -e PERF_HUMANTASK \
+              -d LTO_CLANG \
+              -e LTO_NONE \
+              -d SHADOW_CALL_STACK \
+              -e XIAOMI_MIUI \
+              -d MI_MEMORY_SYSFS \
+              -e TASK_DELAY_ACCT \
+              -e MIUI_ZRAM_MEMORY_TRACKING \
+              -e PERF_HELPER \
+              -e BOOTUP_RECLAIM \
+              -e MI_RECLAIM \
+              -e RTMM \
+              -e MILLET_CGROUP \
+              -e MILLET_SIG \
+              -e MILLET_BINDER \
+              -e MILLET_PKG \
+              -e MILLET_BINDER_GKI \
+              -e MILLET_CORE \
+              -e MILLET_HS \
+              -e BINDER_PRIO \
+              -d REKERNEL \
+              -d REKERNEL_NETWORK \
+            )
+          elif [ "${{ env.TARGET_OS }}" = "aosp" ]; then
+            echo "[*] Injecting AOSP specific configurations..."
+            CONFIG_ARGS+=(\
+              -e REKERNEL \
+              -e REKERNEL_NETWORK \
+            )
+          fi
+
+          if [ ${#CONFIG_ARGS[@]} -gt 0 ]; then
+            ./scripts/config --file "$OUT_DIR/.config" "${CONFIG_ARGS[@]}"
+            make O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" olddefconfig
+          fi
+
+          if [ "${{ env.RUN_DROIDSPACES }}" = "true" ]; then
+            ./scripts/kconfig/merge_config.sh -O "$OUT_DIR" -m "$OUT_DIR/.config" $PATCH_DIR/Patches/Droidspaces/droidspaces.config
+            make O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" olddefconfig
+          fi
+
+          echo "=== 🔎 检查当前即将参与编译的 .config 核心宏 ==="
+          grep -E "KSU|SUSFS|SERIAL|NF_|NETFILTER|BRIDGE_NETFILTER|_NS|CGROUP|PSI|MEMCG|DEVTMPFS|FW_LOADER|ANDROID_PARANOID_NETWORK" "$OUT_DIR/.config" || true
+          cp "$OUT_DIR/.config" "$OUT_DIR/${{ steps.meta.outputs.base_name }}.config"
+          echo "==============================================="
+
+          # 开始多线程并行构建
+          LOG_FILE="${{ github.workspace }}/build.log"
+          make -j"$(nproc --all)" O="$OUT_DIR" "${TOOLCHAIN_ARGS[@]}" 2>&1 | tee "$LOG_FILE"
+          BUILD_EXIT=${PIPESTATUS[0]}
+
+          # 还原 MIUI DTS 备份 (与 build_kernel.sh 一致)
+          if [ "$DTS_PATCHED" = "true" ]; then
+            echo "[*] Restoring DTS backups..."
+            rm -rf "${DTS_SOURCE}"
+            mv ".dts.bak.miui" "${DTS_SOURCE}"
+          fi
+
+          ccache -s | tee -a "$LOG_FILE"
+
+          END_TIME=$(date +%s)
+          DURATION=$((END_TIME - START_TIME))
+          MIN=$((DURATION / 60))
+          SEC=$((DURATION % 60))
+
+          echo "duration_min=${MIN}" >> "$GITHUB_OUTPUT"
+          echo "duration_sec=${SEC}" >> "$GITHUB_OUTPUT"
+          echo "defconfig=${DEFCONFIG}" >> "$GITHUB_OUTPUT"
+          echo "lto_mode=${LTO_MODE}" >> "$GITHUB_OUTPUT"
+
+          exit "$BUILD_EXIT"
+
+      # 11. 校验编译输出产物 (与 build_kernel.sh 对齐：Image 为 APTKernel 打包必需)
+      - name: 校验编译输出
+        run: |
+          if [ -f "$OUT_DIR/arch/arm64/boot/Image" ]; then
+            echo "=== 编译成功 ==="
+          elif [ -f "$OUT_DIR/arch/arm64/boot/Image.gz" ] || [ -f "$OUT_DIR/arch/arm64/boot/Image.gz-dtb" ]; then
+            echo "=== 编译成功 (仅有压缩内核，打包阶段需要未压缩 Image) ==="
+          else
+            echo "=== 编译失败：未找到内核 Image / Image.gz 文件 ===" && exit 1
+          fi
+
+      # 12. 使用 AnyKernel3 打包可刷入包 (APTKernel 风格，与 build_kernel.sh 对齐)
+      #     AstideLabs kona 分支即 SM8250 平台模板：Image + dtb (+dtbo.img) 放入 kernels/<os>/
+      #     alioth 为 A/B 槽设备，kona 模板已适配
+      - name: 使用 AnyKernel3 打包可刷入包 (APTKernel 风格)
+        run: |
+          echo "正在克隆 AnyKernel3 (AstideLabs kona 分支)..."
+          rm -rf "${{ env.ANYKERNEL_DIR }}"
+          git clone https://github.com/AstideLabs/AnyKernel3 -b kona --single-branch --depth=1 "${{ env.ANYKERNEL_DIR }}"
+
+          cd "${{ env.ANYKERNEL_DIR }}"
+          sed -i "s/^device\.name1=.*/device.name1=${{ env.DEVICE }}/" anykernel.sh
+
+          BOOT_DIR="${{ env.OUT_DIR }}/arch/arm64/boot"
+
+          if [ ! -f "$BOOT_DIR/Image" ]; then
+            echo "❌ 未找到未压缩内核 Image ($BOOT_DIR/Image)，无法按 APTKernel 方式打包" && exit 1
+          fi
+
+          rm -rf kernels/*
+          mkdir -p "kernels/${{ env.TARGET_OS }}/"
+          cp "$BOOT_DIR/Image" "kernels/${{ env.TARGET_OS }}/"
+          if [ -f "$BOOT_DIR/dtb" ]; then
+            cp "$BOOT_DIR/dtb" "kernels/${{ env.TARGET_OS }}/"
+          else
+            echo "❌ 未找到独立 dtb 文件 ($BOOT_DIR/dtb)" && exit 1
+          fi
+          [ -f "$BOOT_DIR/dtbo.img" ] && cp "$BOOT_DIR/dtbo.img" "kernels/${{ env.TARGET_OS }}/"
+
+          KSU_ZIP_STR="NoKernelSU"
+          [ "${{ env.RUN_KSU_SUSFS }}" = "true" ] && KSU_ZIP_STR="ReSukiSU-SuSFS"
+          GIT_COMMIT_ID=$(git -C "$KERNEL_DIR" rev-parse --short=8 HEAD 2>/dev/null || echo "unknown")
+          OS_UPPER=$(echo "${{ env.TARGET_OS }}" | tr '[:lower:]' '[:upper:]')
+          DATE_STR=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M%S')
+
+          ZIP_FILENAME="APTKernel_${OS_UPPER}_${{ env.DEVICE }}_${KSU_ZIP_STR}_${DATE_STR}_anykernel3_${GIT_COMMIT_ID}.zip"
+          echo "[*] Zipping $ZIP_FILENAME ..."
+          zip -r9 "$ZIP_FILENAME" ./* -x .git .gitignore "out/*" "*.zip" > /dev/null
+
+          mkdir -p "${{ github.workspace }}/zip_artifacts"
+          mv "$ZIP_FILENAME" "${{ github.workspace }}/zip_artifacts/"
+
+      # 13. 上传 AnyKernel3 可刷入包 (ZIP)
+      - name: 上传 AnyKernel3 可刷入包 (ZIP)
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.base_name }}-Flashable-Packages
+          path: ${{ github.workspace }}/zip_artifacts/*.zip
+          if-no-files-found: error
+          retention-days: 14
+
+      # 14. 上传内核镜像 (compact - 仅 boot 文件夹下核心镜像)
+      - name: 上传内核镜像 (compact - boot 文件夹)
+        if: ${{ (github.event.inputs.artifact_scope || 'compact') == 'compact' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.base_name }}
+          path: ${{ env.OUT_DIR }}/arch/arm64/boot
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 15. 上传全量构建包 (complete - 整个 out 目录)
+      - name: 上传内核构建包 (complete - 整个 out 目录)
+        if: ${{ github.event.inputs.artifact_scope == 'complete' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.base_name }}-out
+          path: ${{ env.OUT_DIR }}
+          if-no-files-found: warn
+          retention-days: 7
+
+      # 16. 上传全量编译日志
+      - name: 上传编译日志
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.base_name }}-log
+          path: ${{ github.workspace }}/build.log
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 17. 上传最终配置
+      - name: 上传最终配置
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ steps.meta.outputs.base_name }}-config
+          path: ${{ env.OUT_DIR }}/${{ steps.meta.outputs.base_name }}.config
+          if-no-files-found: warn
+          retention-days: 14
+
+      # 18. 在页面生成可视化构建摘要
+      - name: 写入编译摘要
+        if: always()
+        run: |
+          {
+            echo "## 内核编译运行摘要 (alioth)"
+            echo ""
+            echo "| 项目 | 配置参数值 |"
+            echo "|---|---|"
+            echo "| 目标设备 | **${{ env.DEVICE }} (SM8250)** |"
+            echo "| 内核分支 | \`${{ env.BUILD_BRANCH }}\` |"
+            echo "| 目标系统 (含专属配置集) | \`${{ env.TARGET_OS }}\` |"
+            echo "| 配置文件 (Defconfig) | \`${{ steps.build.outputs.defconfig }}\` |"
+            echo "| 所用工具链 (Toolchain) | \`${{ github.event.inputs.toolchain || 'neutron' }}\` |"
+            echo "| LTO 优化模式 | \`${{ steps.build.outputs.lto_mode }}\` |"
+            echo "| 实际编译耗时 | **${{ steps.build.outputs.duration_min }} 分 ${{ steps.build.outputs.duration_sec }} 秒** |"
+            echo "| ReSukiSU 模块状态 | **${{ env.RUN_KSU_SUSFS == 'true' && '已启用' || '未启用' }}** |"
+            echo "| 挂钩选择 (Hook Type) | \`${{ env.HOOK_TYPE }}\` |"
+            echo "| Droidspaces 状态 | **${{ env.RUN_DROIDSPACES == 'true' && '已注入' || '未启用' }}** |"
+            echo "| Baseband-guard 状态 | **${{ env.RUN_BBG == 'true' && '已集成' || '未启用' }}** |"
+            echo "| 任务最终状态 | **${{ job.status }}** |"
+          } >> "$GITHUB_STEP_SUMMARY"
