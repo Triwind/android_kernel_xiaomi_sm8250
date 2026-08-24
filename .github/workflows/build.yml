@@ -116,7 +116,7 @@ concurrency:
 
 jobs:
   build:
-    name: Build ${{ env.DEVICE }} | KSU:${{ env.RUN_KSU_SUSFS }} | Hook:${{ env.HOOK_TYPE }} | OS:${{ env.TARGET_OS }}
+    name: Build alioth | ReSukiSU/SUSFS + Baseband-guard + Droidspaces
     runs-on: ubuntu-latest
     timeout-minutes: 120
 
