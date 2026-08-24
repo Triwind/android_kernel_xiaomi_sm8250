@@ -1,19 +1,17 @@
 # =============================================================================
-# Custom Kernel 4.19 for Xiaomi alioth (Mi 11 / SM8250)
+# Custom Kernel 4.19 for Xiaomi alioth (Redmi K40 / POCO F3 / Mi 11X, SM8250)
 # -----------------------------------------------------------------------------
 # 由两份工作流整合而来，并已对齐外部编译脚本 build_kernel.sh (APTKernel)：
 #   - build.yml       （whyred 全功能内联版：多工具链 / SUSFS / Droidspaces）
 #   - build-1.yml     （多机型轻量版：机型选择 + KSU 开关 + zyc-clang）
 #   - build_kernel.sh （APTKernel 外部脚本：Baseband-guard / MIUI-AOSP 配置集 / kona AK3 打包）
-# 本版面向 alioth：A/B 槽设备、Image.gz + dtb、非 GKI 4.19。
+# 本版面向 alioth：A/B 槽设备、Image + dtb、非 GKI 4.19。
 # 放置路径：<你的内核源码仓库>/.github/workflows/build.yml
+# 仅支持手动触发 (workflow_dispatch)；默认工具链 neutron。
 # =============================================================================
 name: "Custom Kernel 4.19 for alioth"
 
 on:
-  push:
-    branches:
-      - android16-aptusitu   # 本仓库内核源码分支；不需要 push 自动构建可整段删除
   workflow_dispatch:
     inputs:
       branch:
@@ -23,7 +21,7 @@ on:
       toolchain:
         description: '选择 Clang 工具链 / 编译器'
         required: false
-        default: 'aosp'
+        default: 'neutron'
         type: choice
         options:
           - aosp
@@ -172,7 +170,7 @@ jobs:
 
       # 6.1 AOSP Clang（默认；固定 tag 缓存，最稳）
       - name: 缓存 AOSP Clang 工具链
-        if: ${{ (github.event.inputs.toolchain || 'aosp') == 'aosp' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'aosp' }}
         id: cache-aosp
         uses: actions/cache@v6
         with:
@@ -180,7 +178,7 @@ jobs:
           key: aosp-clang-${{ env.AOSP_CLANG_TAG }}
 
       - name: 下载 AOSP Clang 工具链
-        if: ${{ (github.event.inputs.toolchain || 'aosp') == 'aosp' && steps.cache-aosp.outputs.cache-hit != 'true' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'aosp' && steps.cache-aosp.outputs.cache-hit != 'true' }}
         run: |
           mkdir -p "$TC_AOSP_DIR"
           curl -L --fail \
@@ -191,13 +189,13 @@ jobs:
 
       # 6.2 获取当前周数（用于 Neutron/ZyC 缓存校验）
       - name: 获取当前周数 (用于 Neutron/ZyC 缓存校验)
-        if: ${{ github.event.inputs.toolchain == 'neutron' || github.event.inputs.toolchain == 'zyc' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') != 'aosp' }}
         id: get-date
         run: echo "date=$(date +'%Y-%U')" >> "$GITHUB_OUTPUT"
 
       # 6.3 Neutron Clang
       - name: 缓存 Neutron Clang 工具链
-        if: ${{ github.event.inputs.toolchain == 'neutron' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'neutron' }}
         id: cache-neutron
         uses: actions/cache@v6
         with:
@@ -207,7 +205,7 @@ jobs:
             neutron-clang-
 
       - name: 下载 Neutron Clang 工具链
-        if: ${{ github.event.inputs.toolchain == 'neutron' && steps.cache-neutron.outputs.cache-hit != 'true' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'neutron' && steps.cache-neutron.outputs.cache-hit != 'true' }}
         run: |
           mkdir -p "$TC_NEUTRON_DIR"
           cd "$TC_NEUTRON_DIR"
@@ -217,7 +215,7 @@ jobs:
 
       # 6.4 ZyCromerZ Clang（跟随上游最新 release）
       - name: 缓存 ZyC Clang 工具链
-        if: ${{ github.event.inputs.toolchain == 'zyc' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'zyc' }}
         id: cache-zyc
         uses: actions/cache@v6
         with:
@@ -227,7 +225,7 @@ jobs:
             zyc-clang-
 
       - name: 下载 ZyC Clang 工具链
-        if: ${{ github.event.inputs.toolchain == 'zyc' && steps.cache-zyc.outputs.cache-hit != 'true' }}
+        if: ${{ (github.event.inputs.toolchain || 'neutron') == 'zyc' && steps.cache-zyc.outputs.cache-hit != 'true' }}
         run: |
           mkdir -p "$TC_ZYC_DIR"
           echo "正在获取 ZyC Clang 最新下载链接..."
@@ -251,10 +249,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.ccache
-          key: ccache-${{ github.event.inputs.toolchain || 'aosp' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-${{ github.run_id }}
+          key: ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-${{ github.run_id }}
           restore-keys: |
-            ccache-${{ github.event.inputs.toolchain || 'aosp' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-
-            ccache-${{ github.event.inputs.toolchain || 'aosp' }}-${{ env.DEVICE }}-
+            ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-${{ github.event.inputs.defconfig || 'alioth_defconfig' }}-
+            ccache-${{ github.event.inputs.toolchain || 'neutron' }}-${{ env.DEVICE }}-
 
       - name: 初始化 ccache 设置
         run: |
@@ -431,7 +429,7 @@ jobs:
       # 8. 配置选定工具链到环境变量 PATH
       - name: 配置工具链环境变量 PATH
         run: |
-          TOOLCHAIN_CHOICE="${{ github.event.inputs.toolchain || 'aosp' }}"
+          TOOLCHAIN_CHOICE="${{ github.event.inputs.toolchain || 'neutron' }}"
           if [ "$TOOLCHAIN_CHOICE" = "neutron" ]; then
             echo "激活编译器: Neutron Clang"
             echo "$TC_NEUTRON_DIR/bin" >> "$GITHUB_PATH"
@@ -457,7 +455,7 @@ jobs:
           BRANCH_SAFE="${BRANCH_NAME//\//-}"
 
           DATE_STR=$(TZ='Asia/Shanghai' date +'%Y%m%d_%H%M')
-          TOOLCHAIN_LABEL="${{ github.event.inputs.toolchain || 'aosp' }}"
+          TOOLCHAIN_LABEL="${{ github.event.inputs.toolchain || 'neutron' }}"
 
           TRACK=""
           if [ "${{ env.RUN_KSU_SUSFS }}" = "true" ]; then
@@ -806,7 +804,7 @@ jobs:
             echo "| 内核分支 | \`${{ env.BUILD_BRANCH }}\` |"
             echo "| 目标系统 (含专属配置集) | \`${{ env.TARGET_OS }}\` |"
             echo "| 配置文件 (Defconfig) | \`${{ steps.build.outputs.defconfig }}\` |"
-            echo "| 所用工具链 (Toolchain) | \`${{ github.event.inputs.toolchain || 'aosp' }}\` |"
+            echo "| 所用工具链 (Toolchain) | \`${{ github.event.inputs.toolchain || 'neutron' }}\` |"
             echo "| LTO 优化模式 | \`${{ steps.build.outputs.lto_mode }}\` |"
             echo "| 实际编译耗时 | **${{ steps.build.outputs.duration_min }} 分 ${{ steps.build.outputs.duration_sec }} 秒** |"
             echo "| ReSukiSU 模块状态 | **${{ env.RUN_KSU_SUSFS == 'true' && '已启用' || '未启用' }}** |"
