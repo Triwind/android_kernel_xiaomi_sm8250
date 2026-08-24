@@ -27,55 +27,6 @@ on:
           - aosp
           - neutron
           - zyc
-      defconfig:
-        description: 'Defconfig (位于 arch/arm64/configs/ 下；支持空格分隔多个片段)'
-        required: false
-        default: 'alioth_defconfig'
-      lto_mode:
-        description: 'LTO 优化模式 (thin/full/none)'
-        required: false
-        default: 'thin'
-        type: choice
-        options:
-          - thin
-          - full
-          - none
-      artifact_scope:
-        description: '上传的产物范围'
-        required: false
-        default: 'compact'
-        type: choice
-        options:
-          - compact
-          - complete
-      enable_ksu_susfs:
-        description: '开启 ReSukiSU 功能模块'
-        required: true
-        type: boolean
-        default: true
-      hook_type:
-        description: '选择 ReSukiSU 挂钩类型 (二选一)'
-        required: true
-        default: 'inline_susfs'
-        type: choice
-        options:
-          - 'inline_susfs'
-          - 'manual_hook'
-      enable_droidspaces:
-        description: '注入 Droidspaces & 容器化基础设施适配'
-        required: true
-        type: boolean
-        default: true
-      enable_baseband_guard:
-        description: '集成 Baseband-guard 基带分区防护 (与 build_kernel.sh 对齐)'
-        required: true
-        type: boolean
-        default: true
-      miui_dts_patches:
-        description: 'target_os=miui 时应用原脚本 DTS 面板补丁 (面板名未必匹配 alioth)'
-        required: false
-        type: boolean
-        default: false
       target_os:
         description: '目标系统 (miui=MIUI配置集+强制LTO关闭; aosp=AOSP配置集)'
         required: false
@@ -85,6 +36,55 @@ on:
           - aosp
           - miui
 
+      lto_mode:
+        description: 'LTO 优化模式 (thin/full/none)'
+        required: false
+        default: 'thin'
+        type: choice
+        options:
+          - thin
+          - full
+          - none
+      hook_type:
+        description: '选择 ReSukiSU 挂钩类型 (二选一)'
+        required: true
+        default: 'inline_susfs'
+        type: choice
+        options:
+          - 'inline_susfs'
+          - 'manual_hook'
+      enable_ksu_susfs:
+        description: '开启 ReSukiSU 功能模块'
+        required: true
+        type: boolean
+        default: true
+      enable_baseband_guard:
+        description: '集成 Baseband-guard 基带分区防护 (与 build_kernel.sh 对齐)'
+        required: true
+        type: boolean
+        default: true
+      enable_droidspaces:
+        description: '注入 Droidspaces & 容器化基础设施适配'
+        required: true
+        type: boolean
+        default: true
+      miui_dts_patches:
+        description: 'target_os=miui 时应用原脚本 DTS 面板补丁 (面板名未必匹配 alioth)'
+        required: false
+        type: boolean
+        default: false
+      defconfig:
+        description: 'Defconfig (位于 arch/arm64/configs/ 下；支持空格分隔多个片段)'
+        required: false
+        default: 'alioth_defconfig'
+      artifact_scope:
+        description: '上传的产物范围'
+        required: false
+        default: 'compact'
+        type: choice
+        options:
+          - compact
+          - complete
 env:
   DEVICE: alioth
   KERNEL_DIR: ${{ github.workspace }}/kernel
