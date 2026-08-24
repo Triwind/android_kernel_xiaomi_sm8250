@@ -77,7 +77,7 @@ on:
         type: boolean
         default: false
       target_os:
-        description: '目标系统标识 (仅用于产物命名与摘要)'
+        description: '目标系统 (miui=MIUI配置集+强制LTO关闭; aosp=AOSP配置集)'
         required: false
         default: 'aosp'
         type: choice
