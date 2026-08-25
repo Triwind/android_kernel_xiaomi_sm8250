@@ -335,19 +335,17 @@ jobs:
         if: env.RUN_KSU_SUSFS == 'true'
         run: |
           cd "$KERNEL_DIR"
-          if [ -d "drivers/kernelsu" ]; then
-            echo "✅ 检测到 drivers/kernelsu 已存在，跳过 ReSukiSU 注入。"
+          if [ -d "drivers/kernelsu" ] || [ -d "KernelSU" ]; then
+            echo "✅ 检测到 ReSukiSU 已注入，跳过。"
           else
             KSU_REF="${{ github.event.inputs.ksu_ref || 'b2ac2fc8703ce9f5226e2a38a59f8b72f8a3005c' }}"
-            echo "🚀 正在拉取 ReSukiSU setup.sh 注入内核..."
-            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main || curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash
-            if [ "$KSU_REF" != "main" ] && [ -d "drivers/kernelsu/.git" ]; then
-              echo "[*] 将 ReSukiSU 钉到兼容提交: $KSU_REF"
-              echo "    (原因: main 于 2026-08-24 起 sync with latest susfs, 与本源码内置旧版 SUSFS 存在符号代差)"
-              git -C drivers/kernelsu fetch --depth=1 origin "$KSU_REF"
-              git -C drivers/kernelsu checkout --detach FETCH_HEAD
-            fi
-            echo "✅ KernelSU setup finished (ref=$KSU_REF)."
+            echo "🚀 正在拉取 ReSukiSU setup.sh 注入内核 (ref=$KSU_REF)..."
+            echo "    (默认钉在该提交: main 于 2026-08-24 sync latest susfs, 与本源码内置旧版 SUSFS 有符号代差)"
+            curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s "$KSU_REF" \
+              || { echo "[!] 主源失败, 使用 xmanweb 镜像..."; curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash -s "$KSU_REF"; }
+            echo "✅ KernelSU setup finished."
+            ls -la drivers/kernelsu | head -2
+            grep -c "zygote_next\|current_proc_no_su" KernelSU/kernel/feature/sucompat.c | xargs echo "    新符号引用数(应为0):" || true
           fi
 
       - name: "集成阶段 3A: 应用 JackA1ltman Non-GKI 核心基础设施 (inline_susfs 分支)"
