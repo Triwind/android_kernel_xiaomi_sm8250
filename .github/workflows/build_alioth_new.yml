@@ -45,6 +45,10 @@ on:
           - thin
           - full
           - none
+      ksu_ref:
+        description: 'ReSukiSU 版本 (默认钉在兼容旧 SUSFS 的提交；源码升级 SUSFS 后可填 main)'
+        required: false
+        default: 'b2ac2fc8703ce9f5226e2a38a59f8b72f8a3005c'
       hook_type:
         description: '选择 ReSukiSU 挂钩类型 (二选一)'
         required: true
@@ -334,9 +338,16 @@ jobs:
           if [ -d "drivers/kernelsu" ]; then
             echo "✅ 检测到 drivers/kernelsu 已存在，跳过 ReSukiSU 注入。"
           else
+            KSU_REF="${{ github.event.inputs.ksu_ref || 'b2ac2fc8703ce9f5226e2a38a59f8b72f8a3005c' }}"
             echo "🚀 正在拉取 ReSukiSU setup.sh 注入内核..."
             curl -LSs "https://raw.githubusercontent.com/ReSukiSU/ReSukiSU/main/kernel/setup.sh" | bash -s main || curl -LSs "https://raw.githubusercontent.com/xmanweb/ReSukiSU/main/kernel/setup.sh" | bash
-            echo "✅ KernelSU setup finished."
+            if [ "$KSU_REF" != "main" ] && [ -d "drivers/kernelsu/.git" ]; then
+              echo "[*] 将 ReSukiSU 钉到兼容提交: $KSU_REF"
+              echo "    (原因: main 于 2026-08-24 起 sync with latest susfs, 与本源码内置旧版 SUSFS 存在符号代差)"
+              git -C drivers/kernelsu fetch --depth=1 origin "$KSU_REF"
+              git -C drivers/kernelsu checkout --detach FETCH_HEAD
+            fi
+            echo "✅ KernelSU setup finished (ref=$KSU_REF)."
           fi
 
       - name: "集成阶段 3A: 应用 JackA1ltman Non-GKI 核心基础设施 (inline_susfs 分支)"
